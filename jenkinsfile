@@ -1,0 +1,213 @@
+pipeline {
+    agent any
+    stages {
+            stage('load parameters') { 
+            steps {
+                load "parameters.groovy"
+            }
+        }
+        stage('source code checkout') {
+            steps {
+               	 			git "${env.SAST_GIT_URL}"
+					sh 'git clone https://github.com/harishpallapu/sonarqube-scanner-scripts.git'
+            }
+        }
+        stage('SAST analysis') {
+            steps {
+			      script {
+						try {
+							sh 'cp -r sonarqube-scanner-scripts/* .'
+							sh './sonar-scanner-4.6.2.2472-linux/bin/sonar-scanner'
+							sh 'ls -al'
+							sh 'cat .scannerwork/report-task.txt  | mail -s "Build-no-${BUILD_NUMBER}-sonar-reports-sucessfull" nihas0505@gmail.com'
+						} catch (err) {
+							echo err.getMessage()
+							unstable(message: "${STAGE_NAME} is unstable")
+							echo "Error detected, ${env.STAGE_NAME} failed..................!"
+							JiraFunction()
+						}   
+					}
+			}
+	}
+        stage('SCA') {
+            steps {
+			      script {
+						try {
+							sh 'wget https://github.com/jeremylong/DependencyCheck/releases/download/v6.2.2/dependency-check-6.2.2-release.zip'
+							sh 'unzip -q dependency-check-6.2.2-release.zip'
+							sh './dependency-check/bin/dependency-check.sh --noupdate --project "TeachersFCU" --scan "Shoppingcart/lib/" --format HTML --out .'
+						
+						} catch (err) {
+							echo err.getMessage()
+							unstable(message: "${STAGE_NAME} is unstable")
+							echo "Error detected, ${env.STAGE_NAME} failed..................!"
+							JiraFunction()
+						}
+				}
+
+	    }
+        }
+	stage('build') {
+            steps {
+				script {
+						try {
+							sh 'mvn clean package'
+						} catch (err) {
+							echo err.getMessage()
+							unstable(message: "${STAGE_NAME} is unstable")
+							echo "Error detected, ${env.STAGE_NAME} failed..................!"
+							JiraFunction()
+						}
+				}							
+            }
+	 }
+	stage('deploy to tomcat') {
+            			steps {
+					script {
+						try {
+							sshagent(['deploy_user']) {
+							sh "scp -o StrictHostKeyChecking=no target/*.war ec2-user@${env.TOMCAT_IP}:/opt/tomcat/webapps"		
+						}
+						} catch (err) {
+							echo err.getMessage()
+							unstable(message: "${STAGE_NAME} is unstable")
+							echo "Error detected, ${env.STAGE_NAME} failed..................!"
+							JiraFunction()
+						}		
+					}
+				}
+	}
+	stage('FunctionalAutomation_Web') {
+           			steps {
+		   			script {
+						try {
+							sh """git clone ${env.FUNCTIONAL_WEB_GIT_URL}
+							cd webtest
+							mvn test """
+						} catch (err) {
+							echo err.getMessage()
+							unstable(message: "${STAGE_NAME} is unstable")
+							echo "Error detected, ${env.STAGE_NAME} failed..................!"
+							JiraFunction()
+						}					
+					}
+	 		}
+	 }
+	stage('FunctionalAutomation_Mobile') {
+            				steps {
+		   			script {
+						try {
+							sh """ git clone ${env.FUNCTIONAL_MOBILE_GIT_URL}
+							cd mobiletest
+							mvn test """
+						} catch (err) {
+							echo err.getMessage()
+							unstable(message: "${STAGE_NAME} is unstable")
+							echo "Error detected, ${env.STAGE_NAME} failed..................!"
+							JiraFunction()
+							}
+					}
+				}
+	}
+	 stage('DAST') {
+            			steps {
+		   			script {
+						try {
+							sh """mkdir dast-testing
+							cd dast-testing
+							wget https://github.com/Arachni/arachni/releases/download/v1.5.1/arachni-1.5.1-0.5.12-linux-x86_64.tar.gz
+							tar -xvzf arachni-1.5.1-0.5.12-linux-x86_64.tar.gz
+							chmod 777 -R *
+							mv arachni-1.5.1-0.5.12 arachni
+							./arachni/bin/arachni http://${env.TOMCAT_IP}:8080/SpringMVCAnnotationShoppingCart/ --checks=* --report-save-path=reports.afr
+							./arachni/bin/arachni_reporter reports.afr --reporter=html:outfile=report-${BUILD_NUMBER}.zip """			
+            					} catch (err) {
+							echo err.getMessage()
+							unstable(message: "${STAGE_NAME} is unstable")
+							echo "Error detected, ${env.STAGE_NAME} failed..................!"
+							JiraFunction()
+							}
+					}
+			}
+	}
+        stage('Performance') {
+            			steps {
+		   			script {
+						try {
+							sh 'pwd'
+							sh 'ls -al'
+							sh "git clone ${env.JMETER_GIT_URL}"
+							sh """cd folder
+							chmod 777 -R *
+							./apache-jmeter-5.4.1/apache-jmeter-5.4.1/bin/jmeter -n -t OnlineShop_1.jmx -l OnlineShop_result_${BUILD_NUMBER}.jtl -e -o OnlineShop_${BUILD_NUMBER}.html """
+            					} catch (err) {
+							echo err.getMessage()
+							unstable(message: "${STAGE_NAME} is unstable")
+							echo "Error detected, ${env.STAGE_NAME} failed..................!"
+							JiraFunction()
+							}
+					}
+			}
+		}
+	stage('upload reports to nexus') {
+            steps {
+	    			sh 'zip -r web-test-report-${BUILD_NUMBER}.zip webtest/src/test/java/com/shoppingcart/Reports/*'
+	    			sh 'zip -r mobile-test-report-${BUILD_NUMBER}.zip mobiletest/src/test/java/com/shoppingcart/Reports/*'
+				sh 'zip -r jmeterreport-${BUILD_NUMBER}.zip folder/OnlineShop_${BUILD_NUMBER}.html/*'
+				
+				sh 'mkdir test-reports'
+				
+				sh 'cp .scannerwork/report-task.txt test-reports'
+				sh 'cp jmeterreport-${BUILD_NUMBER}.zip test-reports'
+				sh 'cp web-test-report-$BUILD_NUMBER.zip test-reports'
+				sh 'cp mobile-test-report-$BUILD_NUMBER.zip test-reports'
+				sh 'cp -r dast-testing/report-${BUILD_NUMBER}.zip test-reports'
+				
+				sh """
+				    cd test-reports
+				    mv report-task.txt report-task-${BUILD_NUMBER}.txt
+				    curl --upload-file report-task-${BUILD_NUMBER}.txt -u admin:admin -v http://${env.NEXUS_IP}:8081/repository/jenkins-reports/sast-reports/
+				    curl --upload-file web-test-report-${BUILD_NUMBER}.zip -u admin:admin -v http://${env.NEXUS_IP}:8081/repository/jenkins-reports/web-test-reports/
+				    curl --upload-file mobile-test-report-${BUILD_NUMBER}.zip -u admin:admin -v http://${env.NEXUS_IP}:8081/repository/jenkins-reports/mobile-test-reports/
+				    curl --upload-file report-${BUILD_NUMBER}.zip -u admin:admin -v http://${env.NEXUS_IP}:8081/repository/jenkins-reports/dast-reports/
+				    curl --upload-file jmeterreport-${BUILD_NUMBER}.zip -u admin:admin -v http://${env.NEXUS_IP}:8081/repository/jenkins-reports/jmeter-reports/ """
+            }
+        }
+	}
+	post {
+        // Clean after build
+        always {
+		mail to: 'nihas0505@gmail.com',
+          	subject: "Status of pipeline: ${currentBuild.fullDisplayName}",
+         	body: """${env.BUILD_URL} has result ${currentBuild.result}
+		
+		Please find build reports................................!
+		
+		SAST REPORTS
+		http://${env.NEXUS_IP}:8081/repository/jenkins-reports/sast-reports/report-task-${BUILD_NUMBER}.txt
+		--------------------------------------------------------------------------------------------------------------------------------------
+		FUNCTIONAL AUTOMATION WEB REPORTS
+		http://${env.NEXUS_IP}:8081/repository/jenkins-reports/web-test-reports/web-test-report-${BUILD_NUMBER}.zip
+		----------------------------------------------------------------------------------------------------------------------------------------
+		FUNCTIONAL AUTOMATION MOBILE REPORTS
+		http://${env.NEXUS_IP}:8081/repository/jenkins-reports/mobile-test-reports/mobile-test-report-${BUILD_NUMBER}.zip
+		------------------------------------------------------------------------------------------------------------------------------------------
+		DAST REPORTS
+		http://${env.NEXUS_IP}:8081/repository/jenkins-reports/dast-reports/report-${BUILD_NUMBER}.zip
+		-----------------------------------------------------------------------------------------------------------------------------------------
+		JMETER REPORTS
+		http://${env.NEXUS_IP}:8081/repository/jenkins-reports/jmeter-reports/jmeterreport-${BUILD_NUMBER}.zip
+		
+		THE PIPELINE IS SUCCESSFULL AND THIS MAIL IS TO REQUEST FOR QA SIGNOFF AND PROCEED TO UAT 0R PROD ENV
+		
+		For more information please contact DEVSECOPS team...........!"""
+		jiraSendBuildInfo site: 'vamsisanagala.atlassian.net'
+		cleanWs(cleanWhenNotBuilt: false,
+                    deleteDirs: true,
+                    disableDeferredWipeout: true)
+        }
+    }
+}
+void JiraFunction() {
+    sh ("""curl -D- -H "Authorization: Basic dmFtc2lraXJhbnJlZGR5QGdtYWlsLmNvbTpxdkRZSTNWbUNJdWUzWlZyZ2NiVTA5MjA=" -X POST --data '{"fields":{"project":{"key": "TFF"},"summary": "${env.JOB_NAME} ${env.STAGE_NAME} stage is failed build no-${env.BUILD_NUMBER}.","description": "${env.STAGE_NAME} stage failed.\\n Build URL $BUILD_URL \\n Build Number ${env.BUILD_NUMBER} ","issuetype": {"name": "Bug"}}}' -H "Content-Type: application/json" https://vamsisanagala.atlassian.net/rest/api/2/issue""")
+	}
